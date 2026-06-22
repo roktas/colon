@@ -1,0 +1,840 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "base64"
+require "fileutils"
+require "json"
+require "net/http"
+require "optparse"
+require "securerandom"
+require "time"
+require "uri"
+
+class Sodexo
+  class RefreshError < StandardError
+  end
+
+  class UnauthorizedError < StandardError
+  end
+
+  class UsageError < StandardError
+  end
+
+  CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+  CODEX_USER_AGENT = "codex-cli/1.0.0"
+  ISSUER = "https://auth.openai.com"
+  REFRESH_WINDOW = 300
+  USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+  def initialize(argv)
+    @argv = argv
+    @codex_home = File.expand_path(ENV.fetch("CODEX_HOME", "~/.codex"))
+    @accounts_path = File.join(@codex_home, "accounts.json")
+    @auth_path = File.join(@codex_home, "auth.json")
+    @dry_run = false
+    @json_output = false
+    @refresh = :auto
+    @replace = false
+  end
+
+  def run
+    parse_options
+    if @argv.empty?
+      accounts
+      return
+    end
+
+    command = @argv.shift
+    unless commands.include?(command)
+      @argv.unshift(command)
+      command = "switch"
+    end
+
+    case command
+    when "current"
+      current
+    when "import"
+      import
+    when "list", "ls"
+      list
+    when "path", "paths"
+      paths
+    when "show"
+      show
+    when "status"
+      status
+    when "switch", "use"
+      switch
+    else
+      abort("unknown command: #{command}")
+    end
+  end
+
+  private
+
+  def abort(message)
+    warn("E: #{message}")
+    exit(1)
+  end
+
+  def account_auth_json(account)
+    case account.fetch("auth_mode")
+    when "api_key"
+      {"auth_mode" => "api_key", "OPENAI_API_KEY" => account.fetch("auth_data").fetch("key")}
+    when "chat_g_p_t"
+      auth = account.fetch("auth_data")
+      {
+        "auth_mode" => "chatgpt",
+        "OPENAI_API_KEY" => nil,
+        "tokens" => {
+          "id_token" => auth.fetch("id_token"),
+          "access_token" => auth.fetch("access_token"),
+          "refresh_token" => auth.fetch("refresh_token"),
+          "account_id" => auth["account_id"]
+        },
+        "last_refresh" => Time.now.utc.iso8601
+      }
+    else
+      abort("unsupported auth mode for #{account.fetch("name")}: #{account.fetch("auth_mode")}")
+    end
+  end
+
+  def account_line(account, active_id)
+    marker = account.fetch("id") == active_id ? "*" : " "
+    email = account["email"] || "-"
+    plan = account["plan_type"] || "-"
+    id = account.fetch("id")[0, 8]
+    "#{marker} #{account.fetch("name")}  #{email}  #{plan}  #{id}"
+  end
+
+  def account_name(data, accounts, existing)
+    base = data["email"].to_s.split("@", 2).first
+    base = "account" if base.empty?
+    unique_name(base, accounts, existing)
+  end
+
+  def account_status_text(result, active_id)
+    account = result.fetch("account")
+    marker = account.fetch("id") == active_id ? "*" : " "
+    email = account["email"] || "-"
+    plan = result.dig("usage", "plan_type") || account["plan_type"] || "-"
+    id = account.fetch("id")[0, 8]
+
+    puts("#{marker} #{account.fetch("name")}  #{email}  #{plan}  #{id}")
+    status_body(result, prefix: "  ")
+  end
+
+  def accounts
+    store = load_store
+    list = store.fetch("accounts", [])
+    abort("no accounts; run `sodexo import` first") if list.empty?
+
+    results = list.map { |account| status_result(store, account) }
+    if @json_output
+      puts(JSON.pretty_generate("accounts" => results))
+    else
+      results.each_with_index do |result, index|
+        puts if index.positive?
+        account_status_text(result, store["active_account_id"])
+      end
+    end
+
+    exit(1) if results.any? { |result| result["error"] }
+  end
+
+  def active_account(store)
+    account = selected_account(store)
+    return account if account
+
+    abort("no active account; run `sodexo list` or `sodexo switch ACCOUNT`")
+  end
+
+  def selected_account(store)
+    accounts = store.fetch("accounts", [])
+    auth_account_id = current_account_id
+    matching = if auth_account_id
+      accounts.find { |account| account.dig("auth_data", "account_id") == auth_account_id }
+    end
+
+    return matching if matching
+
+    active = accounts.find { |account| account["id"] == store["active_account_id"] }
+    return active if active
+  end
+
+  def atomic_write_json(path, data)
+    target = write_path(path)
+    dir = File.dirname(target)
+    FileUtils.mkdir_p(dir)
+    tmp = File.join(dir, ".#{File.basename(target)}.tmp-#{Process.pid}-#{SecureRandom.hex(4)}")
+
+    File.write(tmp, "#{JSON.pretty_generate(data)}\n", mode: "w", perm: 0o600)
+    File.rename(tmp, target)
+    File.chmod(0o600, target)
+  ensure
+    FileUtils.rm_f(tmp) if tmp && File.exist?(tmp)
+  end
+
+  def auth_data_from_auth_json(auth)
+    if auth["tokens"].is_a?(Hash)
+      tokens = auth.fetch("tokens")
+      claims = claims_from_id_token(tokens["id_token"])
+      {
+        "auth_mode" => "chat_g_p_t",
+        "auth_data" => {
+          "type" => "chat_g_p_t",
+          "id_token" => tokens.fetch("id_token"),
+          "access_token" => tokens.fetch("access_token"),
+          "refresh_token" => tokens.fetch("refresh_token"),
+          "account_id" => tokens["account_id"] || claims["account_id"]
+        },
+        "email" => claims["email"],
+        "plan_type" => claims["plan_type"],
+        "subscription_expires_at" => claims["subscription_expires_at"]
+      }
+    elsif auth["OPENAI_API_KEY"].to_s != ""
+      {
+        "auth_mode" => "api_key",
+        "auth_data" => {
+          "type" => "api_key",
+          "key" => auth.fetch("OPENAI_API_KEY")
+        },
+        "email" => nil,
+        "plan_type" => nil,
+        "subscription_expires_at" => nil
+      }
+    else
+      abort("auth.json contains neither tokens nor OPENAI_API_KEY")
+    end
+  end
+
+  def claims_from_id_token(token)
+    payload = jwt_payload(token)
+    auth = payload["https://api.openai.com/auth"] || {}
+    {
+      "account_id" => auth["chatgpt_account_id"],
+      "email" => payload["email"],
+      "plan_type" => auth["chatgpt_plan_type"],
+      "subscription_expires_at" => auth["chatgpt_subscription_active_until"]
+    }
+  end
+
+  def commands
+    %w[current import list ls path paths show status switch use]
+  end
+
+  def current_account_id
+    load_json(@auth_path, required: false)&.dig("tokens", "account_id")
+  end
+
+  def credential_fingerprints(account)
+    auth = account["auth_data"] || {}
+    case account["auth_mode"]
+    when "api_key"
+      [["api_key", auth["key"]]]
+    when "chat_g_p_t"
+      %w[access_token id_token refresh_token].map { |key| [key, auth[key]] }
+    else
+      []
+    end
+      .filter_map { |key, value| [key, value] if value.to_s != "" }
+  end
+
+  def current
+    store = load_store
+    active = store.fetch("accounts", []).find { |account| account["id"] == store["active_account_id"] }
+    auth_account_id = current_account_id
+    matching = if auth_account_id
+      store.fetch("accounts", []).find { |account| account.dig("auth_data", "account_id") == auth_account_id }
+    end
+
+    puts("store: #{active ? account_line(active, store["active_account_id"]) : "none"}")
+    puts("auth:  #{matching ? account_line(matching, matching["id"]) : auth_account_id || "none"}")
+  end
+
+  def duration(seconds)
+    seconds = seconds.to_i
+    return "now" if seconds <= 0
+
+    units = [[86_400, "d"], [3_600, "h"], [60, "m"], [1, "s"]]
+    parts = []
+    units.each do |size, suffix|
+      value = seconds / size
+      next if value.zero?
+
+      parts << "#{value}#{suffix}"
+      seconds %= size
+      break if parts.length == 2
+    end
+
+    parts.join(" ")
+  end
+
+  def fetch_usage(account)
+    auth = account.fetch("auth_data")
+    access_token = auth.fetch("access_token")
+    uri = URI(USAGE_URL)
+    request = Net::HTTP::Get.new(uri)
+    request["Authorization"] = "Bearer #{access_token}"
+    request["User-Agent"] = CODEX_USER_AGENT
+    request["chatgpt-account-id"] = auth["account_id"] if auth["account_id"].to_s != ""
+
+    response = send_request(uri, request)
+    raise UnauthorizedError, "usage request unauthorized" if response.is_a?(Net::HTTPUnauthorized)
+    raise UsageError, "usage request failed: #{response_error(response)}" unless response.is_a?(Net::HTTPSuccess)
+
+    JSON.parse(response.body)
+  rescue JSON::ParserError => e
+    raise UsageError, "invalid usage response: #{e.message}"
+  rescue SystemCallError, IOError, Timeout::Error => e
+    raise UsageError, "usage request failed: #{e.message}"
+  end
+
+  def find_account(store, selector)
+    accounts = store.fetch("accounts", [])
+    exact = accounts.select do |account|
+      [account["id"], account["name"], account["email"]].compact.include?(selector)
+    end
+
+    return exact.first if exact.length == 1
+
+    lowered = selector.downcase
+    matches = accounts.select do |account|
+      [account["id"], account["name"], account["email"]].compact.any? { |value| value.downcase.start_with?(lowered) }
+    end
+
+    return matches.first if matches.length == 1
+
+    abort("account not found: #{selector}") if matches.empty?
+    abort("ambiguous account selector: #{selector}")
+  end
+
+  def first_available_account(store)
+    accounts = store.fetch("accounts", [])
+    abort("no accounts; run `sodexo import NAME` first") if accounts.empty?
+
+    current = selected_account(store)
+    current_index = current ? accounts.index { |account| account.fetch("id") == current.fetch("id") } : nil
+    start = current_index ? current_index + 1 : 0
+    ordered = accounts.rotate(start)
+    failures = []
+
+    ordered.each do |account|
+      available, reason = quota_available?(store, account)
+      return account if available
+
+      failures << "#{account.fetch("name")}: #{reason}"
+    end
+
+    abort("no account with available quota: #{failures.join("; ")}")
+  end
+
+  def auth_path_arg?(arg)
+    path = File.expand_path(arg)
+    File.file?(path) || arg.end_with?(".json")
+  end
+
+  def format_time(epoch)
+    Time.at(epoch.to_i).localtime.strftime("%Y-%m-%d %H:%M:%S %Z")
+  end
+
+  def format_window(label, window)
+    return "#{label}: -" unless window
+
+    used = window["used_percent"]
+    left = used ? [100.0 - used.to_f, 0.0].max : nil
+    window_seconds = window["limit_window_seconds"]
+    reset_at = window["reset_at"]
+    reset = reset_at ? "#{format_time(reset_at)} (in #{duration(reset_at.to_i - Time.now.to_i)})" : "-"
+    length = window_seconds ? duration(window_seconds) : "-"
+    "#{label}: #{percent(used)} used, #{percent(left)} left, window #{length}, resets #{reset}"
+  end
+
+  def import
+    selector, source = import_args
+    auth = load_json(source)
+    data = auth_data_from_auth_json(auth)
+    store = load_store
+    now = Time.now.utc.iso8601(9)
+    existing = import_match(store, data, selector)
+
+    if existing && !@replace
+      abort(
+        "account already exists: #{existing.fetch("name")}; use `sodexo import --replace #{existing.fetch("name")}` after re-login"
+      )
+    end
+
+    attrs = {
+      "name" => account_name(data, store.fetch("accounts", []), existing),
+      "email" => data["email"],
+      "plan_type" => data["plan_type"],
+      "subscription_expires_at" => data["subscription_expires_at"],
+      "auth_mode" => data.fetch("auth_mode"),
+      "auth_data" => data.fetch("auth_data"),
+      "last_used_at" => existing&.fetch("last_used_at", nil)
+    }
+
+    if existing
+      existing.merge!(attrs)
+      existing["updated_at"] = now
+      account = existing
+      action = "updated"
+    else
+      account = {"id" => SecureRandom.uuid, "created_at" => now}.merge(attrs)
+      store["accounts"] << account
+      action = "imported"
+    end
+
+    store["active_account_id"] ||= account.fetch("id")
+    save_store(store) unless @dry_run
+
+    puts("#{action} #{account.fetch("name")}#{@dry_run ? " (dry-run)" : ""}")
+  end
+
+  def import_args
+    first = @argv.shift
+    second = @argv.shift
+    abort("usage: sodexo import [--replace] [ACCOUNT] [AUTH_JSON]") if @argv.any?
+
+    selector = nil
+    source = @auth_path
+
+    if @replace
+      if second
+        selector = first
+        source = second
+      elsif first
+        if auth_path_arg?(first)
+          source = first
+        else
+          selector = first
+        end
+      end
+    elsif second
+      source = second
+    elsif first && auth_path_arg?(first)
+      source = first
+    end
+
+    [selector, File.expand_path(source)]
+  end
+
+  def import_match(store, data, selector)
+    return find_account(store, selector) if selector
+
+    account_id = data.dig("auth_data", "account_id")
+    email = data["email"]
+    store.fetch("accounts", []).find do |account|
+      (account_id.to_s != "" && account.dig("auth_data", "account_id") == account_id) ||
+        (email.to_s != "" && account["email"] == email)
+    end
+  end
+
+  def jwt_payload(token)
+    return {} unless token
+
+    parts = token.split(".")
+    return {} unless parts.length >= 2
+
+    segment = parts[1]
+    segment += "=" * ((4 - segment.length % 4) % 4)
+    JSON.parse(Base64.urlsafe_decode64(segment))
+  rescue ArgumentError, JSON::ParserError
+    {}
+  end
+
+  def list
+    store = load_store
+    store.fetch("accounts", []).each { |account| puts(account_line(account, store["active_account_id"])) }
+  end
+
+  def load_json(path, required: true)
+    JSON.parse(File.read(path))
+  rescue Errno::ENOENT
+    return nil unless required
+
+    abort("missing file: #{path}")
+  rescue JSON::ParserError => e
+    abort("invalid JSON in #{path}: #{e.message}")
+  end
+
+  def load_store
+    store = load_json(@accounts_path, required: false)
+    store ||= {"version" => 1, "accounts" => [], "active_account_id" => nil, "masked_account_ids" => []}
+    store["accounts"] ||= []
+    store["masked_account_ids"] ||= []
+    store
+  end
+
+  def parse_options
+    OptionParser
+      .new do |parser|
+        parser.banner = "Usage: sodexo [options] [list|status|switch|current|show|import|paths] [args]"
+        parser.on("--accounts PATH", "Use a custom accounts.json path") { |path|
+          @accounts_path = File.expand_path(path)
+        }
+        parser.on("--auth PATH", "Use a custom Codex auth.json path") { |path| @auth_path = File.expand_path(path) }
+        parser.on("--dry-run", "Show the selected action without writing files") { @dry_run = true }
+        parser.on("--json", "Print machine-readable JSON for status") { @json_output = true }
+        parser.on("--refresh", "Refresh ChatGPT tokens before the selected action") { @refresh = :always }
+        parser.on("--no-refresh", "Do not refresh ChatGPT tokens before the selected action") { @refresh = :never }
+        parser.on("--replace", "Replace an existing account during import") { @replace = true }
+        parser.on("-h", "--help", "Show help") do
+          puts(parser)
+          exit
+        end
+      end
+      .parse!(@argv)
+  end
+
+  def paths
+    puts("accounts: #{@accounts_path}")
+    puts("auth:     #{@auth_path}")
+  end
+
+  def percent(value)
+    return "-" if value.nil?
+
+    format("%.1f%%", value.to_f).sub(".0%", "%")
+  end
+
+  def persist_refresh(store, account)
+    return if @dry_run
+
+    save_store(store)
+    if account.dig("auth_data", "account_id") == current_account_id
+      atomic_write_json(@auth_path, account_auth_json(account))
+    end
+  end
+
+  def quota_available?(store, account)
+    return [true, "api key account"] unless account.fetch("auth_mode") == "chat_g_p_t"
+
+    refreshed = refresh_account(account)
+    persist_refresh(store, account) if refreshed
+    usage = fetch_usage(account)
+    return [true, "available"] unless quota_full?(usage)
+
+    [false, quota_reason(usage)]
+  rescue RefreshError => e
+    [false, "#{e.message}; #{refresh_advice(account)}"]
+  rescue UnauthorizedError, UsageError => e
+    [false, e.message]
+  end
+
+  def quota_full?(usage)
+    [usage.dig("rate_limit", "primary_window"), usage.dig("rate_limit", "secondary_window")]
+      .compact
+      .any? { |window| window["used_percent"].to_f >= 100.0 }
+  end
+
+  def quota_reason(usage)
+    parts = [
+      ["primary", usage.dig("rate_limit", "primary_window")],
+      ["secondary", usage.dig("rate_limit", "secondary_window")]
+    ].filter_map { |label, window| "#{label} #{percent(window["used_percent"])}" if window }
+    "quota full#{parts.empty? ? "" : " (#{parts.join(", ")})"}"
+  end
+
+  def refresh_account(account, force: false)
+    return false unless account.fetch("auth_mode") == "chat_g_p_t"
+    return false if @refresh == :never
+
+    auth = account.fetch("auth_data")
+    return false if !force && @refresh == :auto && !token_expiring?(auth["access_token"])
+
+    refresh_token = auth["refresh_token"].to_s
+    raise RefreshError, "missing refresh token for #{account.fetch("name")}" if refresh_token.empty?
+
+    refreshed = refresh_tokens(refresh_token)
+    id_token = refreshed["id_token"] || auth.fetch("id_token")
+    claims = claims_from_id_token(id_token)
+
+    auth["id_token"] = id_token
+    auth["access_token"] = refreshed.fetch("access_token")
+    auth["refresh_token"] = refreshed["refresh_token"] || refresh_token
+    auth["account_id"] = claims["account_id"] || auth["account_id"]
+    account["email"] = claims["email"] || account["email"]
+    account["plan_type"] = claims["plan_type"] || account["plan_type"]
+    account["subscription_expires_at"] = claims["subscription_expires_at"] || account["subscription_expires_at"]
+    true
+  end
+
+  def refresh_advice(account)
+    "re-login this account with Codex, then run `sodexo import --replace #{account.fetch("name")}`"
+  end
+
+  def refresh_tokens(refresh_token)
+    uri = URI("#{ISSUER}/oauth/token")
+    response = nil
+    last_error = nil
+
+    3.times do |attempt|
+      request = Net::HTTP::Post.new(uri)
+      request["Content-Type"] = "application/x-www-form-urlencoded"
+      request.body = URI.encode_www_form(
+        "grant_type" => "refresh_token",
+        "refresh_token" => refresh_token,
+        "client_id" => CODEX_CLIENT_ID
+      )
+
+      begin
+        response = send_request(uri, request)
+        break
+      rescue SystemCallError, IOError, Timeout::Error => e
+        last_error = e
+        sleep(0.25 * (attempt + 1)) if attempt < 2
+      end
+    end
+
+    raise RefreshError, "token refresh request failed: #{last_error.message}" unless response
+    raise RefreshError, "token refresh failed: #{response_error(response)}" unless response.is_a?(Net::HTTPSuccess)
+
+    JSON.parse(response.body)
+  rescue JSON::ParserError => e
+    raise RefreshError, "invalid token refresh response: #{e.message}"
+  end
+
+  def send_request(uri, request)
+    Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https", open_timeout: 10, read_timeout: 30) do |http|
+      http.request(request)
+    end
+  end
+
+  def response_error(response)
+    detail = nil
+    body = response.body.to_s.strip
+    if body != ""
+      parsed = JSON.parse(body) rescue nil
+      detail = parsed["error_description"] if parsed.is_a?(Hash)
+      detail ||= parsed.dig("error", "message") if parsed.is_a?(Hash) && parsed["error"].is_a?(Hash)
+      detail ||= parsed["error"] if parsed.is_a?(Hash) && parsed["error"].is_a?(String)
+      detail ||= body.lines.first
+    end
+
+    [response.code, detail&.slice(0, 200)].compact.join(" ")
+  end
+
+  def save_store(store)
+    validate_store!(store)
+    atomic_write_json(@accounts_path, store)
+  end
+
+  def show
+    selector = @argv.shift || abort("usage: sodexo show ACCOUNT")
+    account = find_account(load_store, selector)
+    puts(account_line(account, account["id"]))
+    puts("auth: #{account.fetch("auth_mode")}")
+    puts("chatgpt_account_id: #{account.dig("auth_data", "account_id") || "-"}")
+  end
+
+  def status
+    selector = @argv.shift
+    abort("usage: sodexo status [ACCOUNT]") if @argv.any?
+
+    store = load_store
+    account = selector ? find_account(store, selector) : active_account(store)
+    result = status_result(store, account)
+
+    if @json_output
+      puts(JSON.pretty_generate(result))
+    else
+      status_text(result)
+    end
+
+    exit(1) if result["error"]
+  end
+
+  def status_body(result, prefix: "")
+    account = result.fetch("account")
+    token = result.fetch("token")
+    usage = result["usage"]
+
+    puts("#{prefix}auth: #{account["auth_mode"]}")
+    puts("#{prefix}chatgpt_account_id: #{account["chatgpt_account_id"] || "-"}")
+    puts(
+      "#{prefix}token: access expires #{token["access_expires_at"] || "-"}#{token["refreshed"] ? " (refreshed)" : ""}"
+    )
+
+    if usage
+      puts("#{prefix}plan: #{usage["plan_type"] || "-"}")
+      puts("#{prefix}#{format_window("primary", usage["primary"])}")
+      puts("#{prefix}#{format_window("secondary", usage["secondary"])}")
+      puts("#{prefix}credits: #{usage["credits"] || "-"}")
+    end
+
+    puts("#{prefix}error: #{result["error"]}") if result["error"]
+  end
+
+  def status_result(store, account)
+    refreshed = false
+    usage = nil
+    error = nil
+
+    if account.fetch("auth_mode") == "chat_g_p_t"
+      begin
+        refreshed = refresh_account(account)
+        persist_refresh(store, account) if refreshed
+        usage = fetch_usage(account)
+      rescue UnauthorizedError
+        if @refresh == :never
+          error = "usage request unauthorized; refresh disabled"
+        else
+          begin
+            refreshed = refresh_account(account, force: true) || refreshed
+            persist_refresh(store, account) if refreshed
+            usage = fetch_usage(account)
+          rescue RefreshError => e
+            error = "#{e.message}; #{refresh_advice(account)}"
+          rescue UnauthorizedError
+            error = "usage request unauthorized after refresh; #{refresh_advice(account)}"
+          rescue UsageError => e
+            error = e.message
+          end
+        end
+
+      rescue RefreshError => e
+        error = "#{e.message}; #{refresh_advice(account)}"
+      rescue UsageError => e
+        error = e.message
+      end
+    else
+      error = "usage is not available for API key accounts"
+    end
+
+    status_payload(account, usage: usage, refreshed: refreshed, error: error)
+  end
+
+  def status_payload(account, usage:, refreshed:, error:)
+    {
+      "account" => {
+        "id" => account.fetch("id"),
+        "name" => account.fetch("name"),
+        "email" => account["email"],
+        "plan_type" => account["plan_type"],
+        "auth_mode" => account.fetch("auth_mode"),
+        "chatgpt_account_id" => account.dig("auth_data", "account_id")
+      },
+      "token" => {
+        "access_expires_at" => token_expiry(account),
+        "refreshed" => refreshed
+      },
+      "usage" => usage ? usage_summary(usage) : nil,
+      "error" => error
+    }.compact
+  end
+
+  def status_text(result)
+    account = result.fetch("account")
+    puts("account: #{account["name"]}  #{account["email"] || "-"}")
+    status_body(result)
+  end
+
+  def switch
+    selector = @argv.shift
+    abort("usage: sodexo switch [ACCOUNT]") if @argv.any?
+
+    store = load_store
+    account = selector ? find_account(store, selector) : first_available_account(store)
+    refreshed = refresh_account(account)
+    account["last_used_at"] = Time.now.utc.iso8601(9)
+    store["active_account_id"] = account.fetch("id")
+    auth = account_auth_json(account)
+
+    unless @dry_run
+      save_store(store)
+      atomic_write_json(@auth_path, auth)
+    end
+
+    suffix = []
+    suffix << "refreshed" if refreshed
+    suffix << "dry-run" if @dry_run
+    detail = suffix.empty? ? "" : " (#{suffix.join(", ")})"
+    puts("switched to #{account.fetch("name")}#{detail}")
+  rescue RefreshError => e
+    abort("#{e.message}; #{refresh_advice(account)}")
+  end
+
+  def token_expiring?(token)
+    exp = jwt_payload(token)["exp"]
+    return true unless exp
+
+    Time.at(exp.to_i) <= Time.now + REFRESH_WINDOW
+  end
+
+  def token_expiry(account)
+    exp = jwt_payload(account.dig("auth_data", "access_token"))["exp"]
+    return nil unless exp
+
+    format_time(exp)
+  end
+
+  def usage_summary(payload)
+    credits = payload["credits"]
+    credits_text = nil
+    if credits
+      credits_text = if credits["unlimited"]
+        "unlimited"
+      elsif credits["balance"]
+        credits["balance"]
+      elsif credits["has_credits"] == false
+        "none"
+      else
+        "available"
+      end
+    end
+
+    {
+      "plan_type" => payload["plan_type"],
+      "primary" => payload.dig("rate_limit", "primary_window"),
+      "secondary" => payload.dig("rate_limit", "secondary_window"),
+      "credits" => credits_text
+    }
+  end
+
+  def unique_name(base, accounts, existing)
+    taken = accounts
+      .reject { |account| existing && account["id"] == existing["id"] }
+      .filter_map { |account| account["name"] }
+
+    return base unless taken.include?(base)
+
+    dashed = "#{base}-"
+    return dashed unless taken.include?(dashed)
+
+    index = 1
+    loop do
+      name = "#{base}-#{index}"
+      return name unless taken.include?(name)
+
+      index += 1
+    end
+  end
+
+  def validate_store!(store)
+    seen = {}
+    store.fetch("accounts", []).each do |account|
+      credential_fingerprints(account).each do |key, value|
+        previous = seen[[key, value]]
+        if previous
+          abort(
+            "duplicate #{key} in accounts store: #{previous.fetch("name")} (#{previous["email"] || "-"}) and #{account.fetch("name")} (#{account["email"] || "-"}) share the same token; refusing to write"
+          )
+        end
+
+        seen[[key, value]] = account
+      end
+    end
+  end
+
+  def write_path(path)
+    return path unless File.symlink?(path)
+
+    target = File.readlink(path)
+    return target if target.start_with?("/")
+
+    File.expand_path(target, File.dirname(path))
+  end
+end
+
+Sodexo.new(ARGV).run
