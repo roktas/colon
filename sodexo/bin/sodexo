@@ -24,6 +24,7 @@ class Sodexo
   CODEX_USER_AGENT = "codex-cli/1.0.0"
   ISSUER = "https://auth.openai.com"
   REFRESH_WINDOW = 300
+  RESETS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
   USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
   def initialize(argv)
@@ -271,15 +272,8 @@ class Sodexo
   end
 
   def fetch_usage(account)
-    auth = account.fetch("auth_data")
-    access_token = auth.fetch("access_token")
     uri = URI(USAGE_URL)
-    request = Net::HTTP::Get.new(uri)
-    request["Authorization"] = "Bearer #{access_token}"
-    request["User-Agent"] = CODEX_USER_AGENT
-    request["chatgpt-account-id"] = auth["account_id"] if auth["account_id"].to_s != ""
-
-    response = send_request(uri, request)
+    response = send_request(uri, usage_request(account, uri))
     raise UnauthorizedError, "usage request unauthorized" if response.is_a?(Net::HTTPUnauthorized)
     raise UsageError, "usage request failed: #{response_error(response)}" unless response.is_a?(Net::HTTPSuccess)
 
@@ -288,6 +282,16 @@ class Sodexo
     raise UsageError, "invalid usage response: #{e.message}"
   rescue SystemCallError, IOError, Timeout::Error => e
     raise UsageError, "usage request failed: #{e.message}"
+  end
+
+  def fetch_resets(account)
+    uri = URI(RESETS_URL)
+    response = send_request(uri, usage_request(account, uri))
+    return nil unless response.is_a?(Net::HTTPSuccess)
+
+    JSON.parse(response.body)
+  rescue JSON::ParserError, SystemCallError, IOError, Timeout::Error
+    nil
   end
 
   def find_account(store, selector)
@@ -338,8 +342,15 @@ class Sodexo
     Time.at(epoch.to_i).localtime.strftime("%Y-%m-%d %H:%M:%S %Z")
   end
 
-  def format_window(label, window)
-    return "#{label}: -" unless window
+  def format_time_value(value)
+    time = parse_time_value(value)
+    return value.to_s unless time
+
+    format_time(time.to_i)
+  end
+
+  def format_window(window, fallback:)
+    return ["window #{fallback}", "-"] unless window
 
     used = window["used_percent"]
     left = used ? [100.0 - used.to_f, 0.0].max : nil
@@ -347,7 +358,7 @@ class Sodexo
     reset_at = window["reset_at"]
     reset = reset_at ? "#{format_time(reset_at)} (in #{duration(reset_at.to_i - Time.now.to_i)})" : "-"
     length = window_seconds ? duration(window_seconds) : "-"
-    "#{label}: #{percent(used)} used, #{percent(left)} left, window #{length}, resets #{reset}"
+    ["window #{length}", "#{percent(left)} left, resets #{reset}"]
   end
 
   def import
@@ -536,6 +547,15 @@ class Sodexo
     "quota full#{parts.empty? ? "" : " (#{parts.join(", ")})"}"
   end
 
+  def parse_time_value(value)
+    return nil if value.nil? || value.to_s == ""
+    return Time.at(value.to_i) if value.is_a?(Numeric) || value.to_s.match?(/\A\d+\z/)
+
+    Time.parse(value.to_s)
+  rescue ArgumentError
+    nil
+  end
+
   def refresh_account(account, force: false)
     return false unless account.fetch("auth_mode") == "chat_g_p_t"
     return false if @refresh == :never
@@ -615,6 +635,26 @@ class Sodexo
     [response.code, detail&.slice(0, 200)].compact.join(" ")
   end
 
+  def reset_summary(payload)
+    return nil unless payload.is_a?(Hash)
+
+    count = payload["available_count"]
+    credits = payload["credits"].is_a?(Array) ? payload["credits"] : []
+    available = credits.select { |credit| credit.is_a?(Hash) && credit["status"] == "available" }
+    count = available.length if count.nil? && !available.empty?
+
+    expires_at = available
+      .filter_map { |credit| parse_time_value(credit["expires_at"]) }
+      .min
+    parts = []
+    parts << "#{count} available" unless count.nil?
+    if expires_at
+      parts << "next expires #{format_time_value(expires_at.to_i)} (in #{duration(expires_at.to_i - Time.now.to_i)})"
+    end
+
+    parts.empty? ? nil : parts.join(", ")
+  end
+
   def save_store(store)
     validate_store!(store)
     atomic_write_json(@accounts_path, store)
@@ -646,28 +686,12 @@ class Sodexo
   end
 
   def status_body(result, prefix: "")
-    account = result.fetch("account")
-    token = result.fetch("token")
-    usage = result["usage"]
-
-    puts("#{prefix}auth: #{account["auth_mode"]}")
-    puts("#{prefix}chatgpt_account_id: #{account["chatgpt_account_id"] || "-"}")
-    puts(
-      "#{prefix}token: access expires #{token["access_expires_at"] || "-"}#{token["refreshed"] ? " (refreshed)" : ""}"
-    )
-
-    if usage
-      puts("#{prefix}plan: #{usage["plan_type"] || "-"}")
-      puts("#{prefix}#{format_window("primary", usage["primary"])}")
-      puts("#{prefix}#{format_window("secondary", usage["secondary"])}")
-      puts("#{prefix}credits: #{usage["credits"] || "-"}")
-    end
-
-    puts("#{prefix}error: #{result["error"]}") if result["error"]
+    write_status_rows(status_rows(result), prefix: prefix)
   end
 
   def status_result(store, account)
     refreshed = false
+    resets = nil
     usage = nil
     error = nil
 
@@ -676,6 +700,7 @@ class Sodexo
         refreshed = refresh_account(account)
         persist_refresh(store, account) if refreshed
         usage = fetch_usage(account)
+        resets = fetch_resets(account)
       rescue UnauthorizedError
         if @refresh == :never
           error = "usage request unauthorized; refresh disabled"
@@ -684,6 +709,7 @@ class Sodexo
             refreshed = refresh_account(account, force: true) || refreshed
             persist_refresh(store, account) if refreshed
             usage = fetch_usage(account)
+            resets = fetch_resets(account)
           rescue RefreshError => e
             error = "#{e.message}; #{refresh_advice(account)}"
           rescue UnauthorizedError
@@ -702,32 +728,60 @@ class Sodexo
       error = "usage is not available for API key accounts"
     end
 
-    status_payload(account, usage: usage, refreshed: refreshed, error: error)
+    status_payload(account, usage: usage, resets: resets, refreshed: refreshed, error: error)
   end
 
-  def status_payload(account, usage:, refreshed:, error:)
+  def status_payload(account, usage:, resets:, refreshed:, error:)
     {
       "account" => {
         "id" => account.fetch("id"),
         "name" => account.fetch("name"),
         "email" => account["email"],
-        "plan_type" => account["plan_type"],
-        "auth_mode" => account.fetch("auth_mode"),
-        "chatgpt_account_id" => account.dig("auth_data", "account_id")
+        "plan_type" => account["plan_type"]
       },
       "token" => {
         "access_expires_at" => token_expiry(account),
         "refreshed" => refreshed
       },
-      "usage" => usage ? usage_summary(usage) : nil,
+      "usage" => usage ? usage_summary(usage, resets: resets) : nil,
       "error" => error
     }.compact
   end
 
   def status_text(result)
+    write_status_rows(status_rows(result, include_account: true))
+  end
+
+  def status_rows(result, include_account: false)
     account = result.fetch("account")
-    puts("account: #{account["name"]}  #{account["email"] || "-"}")
-    status_body(result)
+    token = result.fetch("token")
+    usage = result["usage"]
+    rows = []
+
+    rows << ["account", "#{account["name"]}  #{account["email"] || "-"}"] if include_account
+    rows <<
+      [
+        "token",
+        "access expires #{token["access_expires_at"] || "-"}#{token["refreshed"] ? " (refreshed)" : ""}"
+      ]
+
+    if usage
+      rows << ["plan", usage["plan_type"] || "-"]
+      rows << format_window(usage["primary"], fallback: "5h")
+      rows << format_window(usage["secondary"], fallback: "7d")
+      rows << ["resets", usage["resets"]] if usage.key?("resets")
+      rows << ["credits", usage["credits"]] if status_credits?(usage["credits"])
+    end
+
+    rows << ["error", result["error"]] if result["error"]
+    rows
+  end
+
+  def status_credits?(credits)
+    return false if credits.nil? || credits == "none"
+
+    text = credits.to_s.strip
+    text != "" && text !~ /\A0(?:\.0+)?\z/
   end
 
   def switch
@@ -769,7 +823,16 @@ class Sodexo
     format_time(exp)
   end
 
-  def usage_summary(payload)
+  def usage_request(account, uri)
+    auth = account.fetch("auth_data")
+    request = Net::HTTP::Get.new(uri)
+    request["Authorization"] = "Bearer #{auth.fetch("access_token")}"
+    request["User-Agent"] = CODEX_USER_AGENT
+    request["chatgpt-account-id"] = auth["account_id"] if auth["account_id"].to_s != ""
+    request
+  end
+
+  def usage_summary(payload, resets:)
     credits = payload["credits"]
     credits_text = nil
     if credits
@@ -789,7 +852,10 @@ class Sodexo
       "primary" => payload.dig("rate_limit", "primary_window"),
       "secondary" => payload.dig("rate_limit", "secondary_window"),
       "credits" => credits_text
-    }
+    }.tap do |summary|
+      summary["resets"] = reset_summary(resets || payload["rate_limit_reset_credits"])
+      summary.delete("resets") unless summary["resets"]
+    end
   end
 
   def unique_name(base, accounts, existing)
@@ -824,6 +890,13 @@ class Sodexo
 
         seen[[key, value]] = account
       end
+    end
+  end
+
+  def write_status_rows(rows, prefix: "")
+    width = rows.map { |key, _value| key.length }.max || 0
+    rows.each do |key, value|
+      puts("#{prefix}#{key}:#{" " * (width - key.length + 1)}#{value}")
     end
   end
 
